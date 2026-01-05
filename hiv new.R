@@ -23,10 +23,9 @@ library(Seurat)
 install.packages("SoupX")
 library(SoupX)
 library(Seurat)
-library(SoupX)
 install.packages("hdf5r")
 library(hdf5r)
-library(hdf5r)
+
 library(dplyr)
 library(ggplot2) # For visualization
 base <- "D:/sens2025621/ARCdata"
@@ -401,19 +400,36 @@ combinedHIV <- subset(
 ncol(combinedHIV)
 
 saveRDS(combinedHIV, "HIV_ATAC_RNA_combined_after_QC.rds")
-#combined1<-readRDS("D:/OneDrive - Linköpings universitet/Documents/HIV_ATAC_RNA_combined_QC.rds")
+combinedHIV<-readRDS("C:/Users/lopde33/OneDrive - Linköpings universitet/Documents/HIV_ATAC_RNA_combined_after_QC.rds")
 
 length(colnames(combinedHIV))       
 Assays(combinedHIV)
 
 nrow(combinedHIV[["RNA"]])   # number of RNA genes
 nrow(combinedHIV[["ATAC"]])  # number of ATAC peaks
-BiocManager::install("glmGamPoi")
+#BiocManager::install("glmGamPoi")
 library(glmGamPoi,lib.loc = "D:/HIV1")
 
 DefaultAssay(combinedHIV) <- "RNA"
-combinedHIV <- SCTransform(combinedHIV, verbose = TRUE)
+combinedHIV <- JoinLayers(combinedHIV)
+#combinedHIV <- SCTransform(combinedHIV, verbose = TRUE)
+#combinedHIV <- RunPCA(combinedHIV, npcs = 30)
+combinedHIV<- NormalizeData(combinedHIV)
+combinedHIV <- FindVariableFeatures(combinedHIV, selection.method = "vst", nfeatures = 2000)
+combinedHIV <- ScaleData(combinedHIV)
 combinedHIV <- RunPCA(combinedHIV, npcs = 30)
+
+n_cells <- ncol(combinedHIV)
+doublet_rate <- 0.075   # 7.5%
+nExp <- round(n_cells * doublet_rate)
+nExp
+combinedHIV<- doubletFinder(combinedHIV, pN = 0.25, pK = 0.09, nExp = nExp, PCs = 1:30)
+head(combinedHIV@meta.data)
+
+df_col <- grep("DF.classifications", colnames(combinedHIV@meta.data), value = TRUE)
+combinedHIV<- subset(combinedHIV, subset = DF.classifications_0.25_0.09_1897 == "Singlet")
+table(Idents(combinedHIV))
+
 DefaultAssay(combinedHIV) <- "ATAC"
 combinedHIV <- RunTFIDF(combinedHIV)
 combinedHIV <- FindTopFeatures(combinedHIV)
@@ -426,3 +442,91 @@ combinedHIV <- FindMultiModalNeighbors(
   dims.list = list(1:30, 2:30)
 )
 Reductions(combinedHIV)
+
+## ---------------- WNN ----------------
+# UMAP
+combinedHIV <- RunUMAP(
+  combinedHIV,
+  nn.name = "weighted.nn",
+  reduction.name = "wnn.umap"
+)
+
+# Clustering
+combinedHIV <- FindClusters(
+  combinedHIV,
+  graph.name = "wsnn",
+  resolution = 0.5
+)  
+DimPlot(combinedHIV, reduction = "wnn.umap", group.by = "orig.ident") +
+  ggtitle("Integrated Analysis")
+
+DimPlot(combinedHIV, reduction = "wnn.umap", group.by = "seurat_clusters",label=TRUE) +
+  ggtitle("WNN clusters")
+
+# Subset only D2 and D3 (or all relevant samples) if needed
+subset_samples <- c("D2_HIV", "D2_ssDNA", "D2_Mock",
+                    "D3_HIV", "D3_ssDNA", "D3_Mock")  # include all timepoints if desired
+
+combined_subset <- subset(combinedHIV, subset = orig.ident %in% subset_samples)
+library(ggplot2)
+# 1. Create a 'condition' column by stripping 'D2_' or 'D3_' from the sample name
+combined_subset$condition <- gsub("D[2-3]_", "", combined_subset$orig.ident)
+
+# 2. Generate the WNN UMAP grouped by the 3 conditions
+DimPlot(combined_subset, 
+        reduction = "wnn.umap", 
+        group.by = "condition", 
+        pt.size = 0.6,
+        cols = c("HIV" = "red", "ssDNA" = "blue", "Mock" = "green")) + 
+  ggtitle("Integrated WNN UMAP: HIV vs ssDNA vs Mock") + 
+  theme_minimal()
+
+saveRDS(combinedHIV,"HIV_ATAC_RNA_WNN.rds")
+# 1. Extract Donor ID (D2 vs D3) from the 'orig.ident' string
+combined_subset$donor <- gsub("_.*", "", combined_subset$orig.ident)
+
+# 2. Extract Condition (HIV, ssDNA, Mock) for coloring
+combined_subset$condition <- gsub("D[2-3]_", "", combined_subset$orig.ident)
+
+# 3. Plot side-by-side: Donor 2 vs Donor 3
+DimPlot(combined_subset, 
+        reduction = "wnn.umap", 
+        split.by = "donor", 
+        group.by = "condition", 
+        pt.size = 0.5,
+        cols = c("HIV" = "red", "ssDNA" = "blue", "Mock" = "green")) +
+  ggtitle("Donor Comparison: D2 (Left) vs D3 (Right)") +
+  theme_minimal()
+# 1. Create a frequency table of Donor vs. Condition
+count_table <- table(combined_subset$donor, combined_subset$condition)
+print("Cell Counts per Donor and Condition:")
+print(count_table)
+
+# 2. Convert to proportions (Percentages)
+prop_table <- prop.table(count_table, margin = 1) * 100
+print("Percentages per Donor:")
+print(prop_table)
+
+# 3. Statistical Test: Chi-squared test for independence
+# Tests if the 'Condition' distribution is the same for both donors
+chi_test <- chisq.test(count_table)
+print(chi_test)
+
+# 4. Visualization: Stacked Bar Plot
+library(ggplot2)
+df_counts <- as.data.frame(count_table)
+colnames(df_counts) <- c("Donor", "Condition", "Count")
+
+ggplot(df_counts, aes(x = Donor, y = Count, fill = Condition)) +
+  geom_bar(stat = "identity", position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_manual(values = c("HIV" = "red", "ssDNA" = "blue", "Mock" = "green")) +
+  theme_minimal() +
+  labs(y = "Proportion of Cells", title = "Cell Distribution by Donor and Condition")
+
+
+
+DefaultAssay(combinedHIV) <- "RNA"
+FeaturePlot(combinedHIV, 
+            features = c("MS4A1", "CD79A", "PAX5"), 
+            reduction = "wnn.umap")
